@@ -5,10 +5,16 @@ pub mod test_conversion;
 
 pub mod img2win_convolution;
 
+use image::Rgb;
 use shader_compiler::build;
 use wgpu::util::DeviceExt;
-
-use LVIElib::{generic_color::PixelMapping, utils::{convert_hsl_to_rgb, convert_rgb_to_hsl, norm_range_f32}};
+use LVIElib::{
+    generic_color::PixelMapping,
+    linear_srgb::LinSrgb,
+    matrix::Matrix,
+    utils::{convert_hsl_to_rgb, convert_rgb_to_hsl, norm_range_f32},
+    white_balance::{xyz_wb_matrix, LINSRGB_TO_XYZ, XYZ_TO_LINSRGB},
+};
 
 fn compute_work_group_count(
     (width, height): (u32, u32),
@@ -38,9 +44,9 @@ fn main() {
 
     exit(0);*/
 
-    let kernel: Vec<u8> = vec![
-        56, 78, 99, 141, 2, 156, 
-        255, 254, 134, 23, 1, 23, 
+    /*let kernel: Vec<u8> = vec![
+        56, 78, 99, 141, 2, 156,
+        255, 254, 134, 23, 1, 23,
         68, 45, 77, 89, 100, 2,
         34, 145, 178, 199, 2, 34,
         123, 167, 178, 99, 89, 2,
@@ -55,12 +61,12 @@ fn main() {
 
     println!("{:?}", out);
 
-    std::process::exit(0);
+    std::process::exit(0);*/
 
     use std::time::Instant;
 
-    let saturation: Vec<f32> = vec![0.1];
-    let d_img = image::open("C:\\Users\\david\\Documents\\workspaces\\original.jpg")
+    let saturation: Vec<f32> = xyz_wb_matrix(5003.0, 0.0, 8000.0, 0.0).consume_content();
+    let d_img = image::open("/home/bolli/Desktop/Projects/LVIE/LVIE-GPU/IMG_4230.JPG")
         .expect("cannot open the image");
 
     use pollster::FutureExt;
@@ -72,12 +78,14 @@ fn main() {
             force_fallback_adapter: false,
             compatible_surface: None,
         })
-        .block_on().expect("Cannot create adapter");
+        .block_on()
+        .expect("Cannot create adapter");
 
     let (device, queue) = adapter
         .request_device(&Default::default(), None)
-        .block_on().expect("cannot create device ad queue");    
-        
+        .block_on()
+        .expect("cannot create device ad queue");
+
     let img = d_img.to_rgba8();
 
     let (width, height) = img.dimensions();
@@ -87,7 +95,7 @@ fn main() {
         height,
         depth_or_array_layers: 1,
     };
-    
+
     let input_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("input texture"),
         size: texture_size,
@@ -121,10 +129,12 @@ fn main() {
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Saturation shader"),
-        source: wgpu::ShaderSource::Wgsl(build("LVIE-GPU/shaders/saturation.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(
+            build("/home/bolli/Desktop/Projects/LVIE/LVIE-GPU/shaders/whitebalance.wgsl").into(),
+        ),
     });
 
-    let saturation_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+    let saturation_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Saturation Buffer"),
         contents: bytemuck::cast_slice(&saturation),
         usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
@@ -171,7 +181,7 @@ fn main() {
         label: Some("Saturation pipeline"),
         layout: None, //Some(&pipeline_layout),
         module: &shader,
-        entry_point: "saturation_main",
+        entry_point: "shader_main",
     });
 
     let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -193,16 +203,17 @@ fn main() {
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: saturation_buffer.as_entire_binding(),
-            }
+            },
         ],
     });
 
     let start = Instant::now();
 
     let mut encoder =
-    device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-    {   let (dispatch_with, dispatch_height) =
+    {
+        let (dispatch_with, dispatch_height) =
             compute_work_group_count((texture_size.width, texture_size.height), (16, 16));
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Saturation pass"),
@@ -217,11 +228,11 @@ fn main() {
 
     let mut pixels: Vec<u8> = vec![0; padded_bytes_per_row * height as usize];
 
-    let out_buffer: wgpu::Buffer = device.create_buffer(&wgpu::BufferDescriptor { 
-        label: Some("out buff"), 
+    let out_buffer: wgpu::Buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out buff"),
         size: pixels.len() as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false 
+        mapped_at_creation: false,
     });
 
     encoder.copy_texture_to_buffer(
@@ -258,18 +269,75 @@ fn main() {
         pixels.copy_from_slice(&padded[..unpadded_bytes_per_row]);
     }
 
-    if let Some(output_image) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, &pixels[..])
-    {
-        output_image.save("shader-saturation.png").expect("Failed to save the image");
-    }
-
     println!("GPU time: {}", start.elapsed().as_millis());
+
+    if let Some(output_image) =
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, &pixels[..])
+    {
+        output_image
+            .save("shader-saturation.png")
+            .expect("Failed to save the image");
+    }
 
     let start = Instant::now();
 
-    convert_hsl_to_rgb(convert_rgb_to_hsl(&d_img.to_rgb8()).map(|hsl|{
-        *hsl.saturation_mut() = norm_range_f32(0.0..=1.0, hsl.saturation() + saturation[0]);
-    })).save("prova_dalla_lib.jpg").expect("Failed to save");
+    let img = d_img.to_rgb8();
+    let ((width, height), img_buf) = (img.dimensions(), img.into_raw());
+
+    let linsrgb_to_xyz = Matrix::new(LINSRGB_TO_XYZ.to_vec(), 3, 3);
+    let xyz_to_linsrgb = Matrix::new(XYZ_TO_LINSRGB.to_vec(), 3, 3);
+    let xyz_mat = xyz_wb_matrix(5000.0, 0.0, 8000.0, 0.0);
+
+    let mut out = Vec::<u8>::new();
+
+    for i in 0..img_buf.len() / 3 {
+        if i % 5472 == 0 {
+            //println!("{}", i / 5472)
+        }
+        let pix: LinSrgb = Rgb([
+            img_buf[3 * i] as f32 / 255.0,
+            img_buf[3 * i + 1] as f32 / 255.0,
+            img_buf[3 * i + 2] as f32 / 255.0,
+        ])
+        .into();
+
+        let mut xyz = (linsrgb_to_xyz.clone() * pix.to_vec().into())
+            .unwrap()
+            .consume_content();
+        let y = xyz[2].clone();
+
+        xyz = xyz.iter().map(|x| x / y).collect();
+        xyz = (xyz_mat.clone() * xyz.into()).unwrap().consume_content();
+        xyz = xyz.iter().map(|x| x * y).collect();
+
+        let v = (xyz_to_linsrgb.clone() * xyz.into())
+            .unwrap()
+            .consume_content();
+
+        let rgb: Rgb<f32> = LinSrgb::new(v[0], v[1], v[2]).into();
+
+        out.push((rgb[0] * 255.0) as u8);
+        out.push((rgb[1] * 255.0) as u8);
+        out.push((rgb[2] * 255.0) as u8);
+    }
 
     println!("CPU time: {}", start.elapsed().as_millis());
+
+    image::save_buffer(
+        "white_balance_rust.png",
+        &out,
+        width,
+        height,
+        image::ColorType::Rgb8,
+    )
+    .unwrap();
+
+    /*convert_hsl_to_rgb(convert_rgb_to_hsl(&d_img.to_rgb8()).map(|hsl| {
+        *hsl.saturation_mut() = norm_range_f32(0.0..=1.0, hsl.saturation() + saturation[0]);
+    }))
+
+
+
+    .save("prova_dalla_lib.jpg")
+    .expect("Failed to save");*/
 }
